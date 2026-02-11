@@ -2,6 +2,8 @@
 
 Aplicație desktop pentru controlul vocal al Home Assistant, cu suport pentru wake word, comenzi locale offline și interfață grafică modernă.
 
+![Logo](logo.png)
+
 ## ✨ Caracteristici
 
 ### 🎯 Funcționalități Principale
