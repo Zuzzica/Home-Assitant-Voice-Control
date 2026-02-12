@@ -198,7 +198,8 @@ class VoiceRecognitionThread(QThread):
         self.wake_word = wake_word.lower()
         self.local_commands = local_commands if local_commands else []
         self.waiting_for_wake_word = True
-        self.energy_threshold = 300  # Prag pentru detectarea sunetului
+        # Prag pentru detectarea sunetului (mai jos = mai sensibil, dar poate prinde mai mult zgomot)
+        self.energy_threshold = 350
         
     def run(self):
         """Rulează bucla de recunoaștere vocală cu wake word"""
@@ -212,7 +213,9 @@ class VoiceRecognitionThread(QThread):
                     self.status_signal.emit("🎤 Ascult comenzi...")
                 
                 # Înregistrare audio cu sounddevice
-                duration = 4 if self.waiting_for_wake_word else 5
+                #  - 4s pentru wake word (robust la tăieri de început/sfârșit)
+                #  - 3s pentru comenzi (răspuns rapid față de 5s inițial)
+                duration = 4 if self.waiting_for_wake_word else 3
                 recording = sd.rec(
                     int(duration * self.sample_rate),
                     samplerate=self.sample_rate,
@@ -283,26 +286,11 @@ class VoiceRecognitionThread(QThread):
         return None
         
     def numpy_to_audiodata(self, recording):
-        """Convertește numpy array la AudioData pentru speech_recognition"""
-        # Convertește int16 la bytes
+        """Convertește numpy array la AudioData pentru speech_recognition, fără creare WAV intermediară"""
+        # Convertește int16 la bytes și creează direct AudioData
         audio_bytes = recording.tobytes()
-        
-        # Creează un buffer WAV în memorie
-        wav_buffer = io.BytesIO()
-        with wave.open(wav_buffer, 'wb') as wav_file:
-            wav_file.setnchannels(self.channels)
-            wav_file.setsampwidth(2)  # 2 bytes pentru int16
-            wav_file.setframerate(self.sample_rate)
-            wav_file.writeframes(audio_bytes)
-        
-        # Resetează pointer-ul la început
-        wav_buffer.seek(0)
-        
-        # Creează AudioData
-        with sr.AudioFile(wav_buffer) as source:
-            audio_data = self.recognizer.record(source)
-            
-        return audio_data
+        # sample_width = 2 bytes (int16)
+        return sr.AudioData(audio_bytes, self.sample_rate, 2)
         
     def stop(self):
         """Oprește thread-ul"""
@@ -314,11 +302,15 @@ class HomeAssistantVoiceApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.config_file = Path.home() / '.ha_voice_config.json'
+        # Indică dacă aplicația ar trebui să pornească minimizată în tray
+        self.start_minimized = False
         self.local_commands = []
         self.wake_word = "asistent"
         self.recognition_thread = None
         self.listening_popup = None  # Popup pentru "Ascult..."
         self.notification_sound = None  # Sunet de notificare
+        # Session HTTP reutilizabil pentru Home Assistant (reduce overhead-ul conexiunilor repetate)
+        self.session = requests.Session()
         self.init_ui()
         self.init_tray()
         self.load_audio_devices()
@@ -711,7 +703,8 @@ class HomeAssistantVoiceApp(QMainWindow):
         }
         
         try:
-            response = requests.post(url, headers=headers, json=data, timeout=10)
+            # Folosește session reutilizabil și timeout mai mic pentru răspuns mai rapid la erori
+            response = self.session.post(url, headers=headers, json=data, timeout=5)
             if response.status_code == 200:
                 result = response.json()
                 response_text = result.get('response', {}).get('speech', {}).get('plain', {}).get('speech', 'Comandă executată')
@@ -739,7 +732,8 @@ class HomeAssistantVoiceApp(QMainWindow):
             data['entity_id'] = cmd_data['entity_id']
         
         try:
-            response = requests.post(url, headers=headers, json=data, timeout=5)
+            # Folosește session reutilizabil și timeout puțin mai mic
+            response = self.session.post(url, headers=headers, json=data, timeout=3)
             if response.status_code == 200:
                 self.log_message(f"✅ Executat: {cmd_data['service']}", "#4CAF50")
             else:
@@ -802,7 +796,10 @@ class HomeAssistantVoiceApp(QMainWindow):
                 self.wake_word_input.setText(config.get('wake_word', 'asistent'))
                 self.wake_word = config.get('wake_word', 'asistent')
                 self.autostart_checkbox.setChecked(config.get('autostart', False))
-                self.minimize_to_tray_checkbox.setChecked(config.get('minimize_to_tray', False))
+                minimize_to_tray = config.get('minimize_to_tray', False)
+                self.minimize_to_tray_checkbox.setChecked(minimize_to_tray)
+                # Salvează preferința pentru a fi folosită în main() la pornire
+                self.start_minimized = minimize_to_tray
                 self.local_commands = config.get('local_commands', [])
                 
                 # Selectează dispozitivul salvat
@@ -812,17 +809,6 @@ class HomeAssistantVoiceApp(QMainWindow):
                     if index >= 0:
                         self.device_combo.setCurrentIndex(index)
                 
-                # Minimizează în tray dacă e configurat
-                if config.get('minimize_to_tray', False):
-                    QApplication.processEvents()
-                    self.hide()
-                    self.tray_icon.showMessage(
-                        "HA Voice Control",
-                        "Pornit minimizat în tray.",
-                        QSystemTrayIcon.Information,
-                        2000
-                    )
-                    
             except Exception as e:
                 self.log_message(f"⚠️ Eroare încărcare: {str(e)}", "#ff9800")
                 
@@ -882,7 +868,17 @@ def main():
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
     window = HomeAssistantVoiceApp()
-    window.show()
+    # Respectă opțiunea "Minimizează în tray la pornire"
+    if not getattr(window, "start_minimized", False):
+        window.show()
+    else:
+        # Fereastra nu se arată; doar o notificare în tray (opțional)
+        window.tray_icon.showMessage(
+            "HA Voice Control",
+            "Pornit minimizat în tray.",
+            QSystemTrayIcon.Information,
+            2000
+        )
     sys.exit(app.exec_())
 
 if __name__ == '__main__':
